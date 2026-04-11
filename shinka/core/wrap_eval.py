@@ -430,6 +430,7 @@ def run_shinka_eval(
             k: effective_default_metrics.get(k, v_default)
             for k, v_default in DEFAULT_METRICS_ON_ERROR.items()
         }
+        metrics["text_feedback"] = "Error message: " + str(e)
         if validate_fn:
             metrics.setdefault("num_valid_runs", 0)
             # Best guess for invalid runs if an exception occurs mid-evaluation
