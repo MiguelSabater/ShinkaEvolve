@@ -167,7 +167,7 @@ def monitor(
 
     start_time = time.time()
     timeout_seconds = parse_time_to_seconds(timeout) if timeout is not None else None
-    grace_seconds = 60.0
+    grace_seconds = 300.0
 
     while process.poll() is None:
         if timeout_seconds and (time.time() - start_time) > timeout_seconds:
