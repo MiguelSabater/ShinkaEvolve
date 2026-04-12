@@ -317,52 +317,84 @@ class JobScheduler:
                 status = get_job_status(job.job_id)
                 return status != ""
             return False  # Should not happen with slurm
-        else:
-            if isinstance(job.job_id, ProcessWithLogging):
-                if (
-                    isinstance(self.config, LocalJobConfig)
-                    and self.config.time
-                    and job.start_time
-                ):
-                    timeout = parse_time_to_seconds(self.config.time)
-                    if time.time() - job.start_time > timeout:
-                        if self.verbose:
-                            logger.warning(
-                                f"Process {job.job_id.pid} exceeded "
-                                f"timeout of {self.config.time}. Killing. "
-                                f"=> Gen. {job.generation}"
-                            )
-                        job.job_id.kill()
-                        return False
 
-                # More robust status checking with exception handling
-                try:
-                    return job.job_id.poll() is None
-                except Exception as e:
-                    # If poll() fails, try alternative methods to determine if process is running
-                    logger.warning(f"poll() failed for PID {job.job_id.pid}: {e}")
-                    try:
-                        # Try using psutil as fallback if available
-                        import psutil
-
-                        return psutil.pid_exists(job.job_id.pid)
-                    except ImportError:
-                        # Fallback: check if PID exists using os.kill with signal 0
-                        try:
-                            import os
-
-                            os.kill(job.job_id.pid, 0)
-                            return True  # Process exists
-                        except (OSError, ProcessLookupError):
-                            return False  # Process doesn't exist
-                    except Exception as e2:
-                        logger.warning(
-                            f"All status check methods failed for PID {job.job_id.pid}: {e2}"
-                        )
-                        # If all methods fail, assume process is dead
-                        return False
+        if not isinstance(job.job_id, ProcessWithLogging):
             return False
 
+        # Timeout handling (local jobs): SIGTERM at timeout, wait grace period, then SIGKILL
+        GRACE_PERIOD_SECONDS = 60
+
+        if (
+                isinstance(self.config, LocalJobConfig)
+                and self.config.time
+                and job.start_time
+        ):
+            timeout = parse_time_to_seconds(self.config.time)
+            elapsed = time.time() - job.start_time
+
+            if elapsed > timeout:
+                pid = getattr(job.job_id, "pid", None)
+
+                # Store the time we first attempted graceful termination so we can enforce the grace period
+                # without blocking this status-check loop.
+                if not hasattr(job, "_term_sent_at"):
+                    job._term_sent_at = None
+
+                if job._term_sent_at is None:
+                    if self.verbose and pid is not None:
+                        logger.warning(
+                            f"Process {pid} exceeded timeout of {self.config.time}. "
+                            f"Sending SIGTERM. => Gen. {job.generation}"
+                        )
+                    try:
+                        # send SIGTERM
+                        job.job_id.terminate()
+                    finally:
+                        job._term_sent_at = time.time()
+
+                    # Still potentially running during grace period
+                    return True
+
+                # Grace period already started; if still within grace, keep reporting running
+                if time.time() - job._term_sent_at < GRACE_PERIOD_SECONDS:
+                    return True
+
+                # Grace period elapsed: kill as before (SIGKILL)
+                if self.verbose and pid is not None:
+                    logger.warning(
+                        f"Process {pid} did not exit after {GRACE_PERIOD_SECONDS}s grace period. "
+                        f"Killing. => Gen. {job.generation}"
+                    )
+                job.job_id.kill()
+                return False
+
+        # More robust status checking with exception handling
+        try:
+            return job.job_id.poll() is None
+        except Exception as e:
+            # If poll() fails, try alternative methods to determine if process is running
+            logger.warning(f"poll() failed for PID {job.job_id.pid}: {e}")
+            try:
+                # Try using psutil as fallback if available
+                import psutil
+
+                return psutil.pid_exists(job.job_id.pid)
+            except ImportError:
+                # Fallback: check if PID exists using os.kill with signal 0
+                try:
+                    import os
+
+                    os.kill(job.job_id.pid, 0)
+                    return True  # Process exists
+                except (OSError, ProcessLookupError):
+                    return False  # Process doesn't exist
+            except Exception as e2:
+                logger.warning(
+                    f"All status check methods failed for PID {job.job_id.pid}: {e2}"
+                )
+                # If all methods fail, assume process is dead
+                return False
+            
     def get_job_results(
         self, job_id: Union[str, ProcessWithLogging], results_dir: str
     ) -> Optional[Dict[str, Any]]:
