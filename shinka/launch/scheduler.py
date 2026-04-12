@@ -309,7 +309,15 @@ class JobScheduler:
         raise ValueError(f"Unknown job type: {self.job_type}")
 
     def check_job_status(self, job) -> bool:
-        """Check if job is running. Returns True if running, False if done."""
+        """Check if job is running.
+
+        Returns True if running, False if done.
+
+        Local jobs with a configured time limit get a grace period:
+          - grace = 10% of the configured time limit (at least 1 second)
+          - when remaining_time <= grace: send SIGTERM once (ask the process to wrap up)
+          - when remaining_time <= 0: kill the process (as before)
+        """
         if self.job_type in ["slurm_docker", "slurm_conda"]:
             from .slurm import get_job_status
 
@@ -321,49 +329,43 @@ class JobScheduler:
         if not isinstance(job.job_id, ProcessWithLogging):
             return False
 
-        # Timeout handling (local jobs): SIGTERM at timeout, wait grace period, then SIGKILL
-        GRACE_PERIOD_SECONDS = 60
-
-        if (
-                isinstance(self.config, LocalJobConfig)
-                and self.config.time
-                and job.start_time
-        ):
+        # Time limit handling for local processes
+        if isinstance(self.config, LocalJobConfig) and self.config.time and job.start_time:
             timeout = parse_time_to_seconds(self.config.time)
+            # Treat 10% of the timeout as grace period; ensure it's at least 1 second.
+            grace = max(1, int(timeout * 0.1))
+
             elapsed = time.time() - job.start_time
+            remaining = timeout - elapsed
 
-            if elapsed > timeout:
-                pid = getattr(job.job_id, "pid", None)
-
-                # Store the time we first attempted graceful termination so we can enforce the grace period
-                # without blocking this status-check loop.
-                if not hasattr(job, "_term_sent_at"):
-                    job._term_sent_at = None
-
-                if job._term_sent_at is None:
-                    if self.verbose and pid is not None:
+            # If we're inside the grace period (but not fully timed out yet), ask it to terminate.
+            if remaining <= grace and remaining > 0:
+                # Ensure we only send SIGTERM once per job
+                if not getattr(job, "sigterm_sent", False):
+                    if self.verbose:
                         logger.warning(
-                            f"Process {pid} exceeded timeout of {self.config.time}. "
-                            f"Sending SIGTERM. => Gen. {job.generation}"
+                            f"Process {job.job_id.pid} entering grace period "
+                            f"({int(remaining)}s remaining of {self.config.time}; "
+                            f"grace={grace}s). Sending SIGTERM. => Gen. {job.generation}"
                         )
                     try:
-                        # send SIGTERM
-                        job.job_id.terminate()
-                    finally:
-                        job._term_sent_at = time.time()
+                        import signal
 
-                    # Still potentially running during grace period
-                    return True
+                        job.job_id.send_signal(signal.SIGTERM)
+                    except Exception as e:
+                        if self.verbose:
+                            logger.warning(
+                                f"Failed to send SIGTERM to PID {job.job_id.pid}: {e}. "
+                                f"Will still enforce hard timeout. => Gen. {job.generation}"
+                            )
+                    job.sigterm_sent = True
 
-                # Grace period already started; if still within grace, keep reporting running
-                if time.time() - job._term_sent_at < GRACE_PERIOD_SECONDS:
-                    return True
-
-                # Grace period elapsed: kill as before (SIGKILL)
-                if self.verbose and pid is not None:
+            # If grace period is also exhausted, kill it as usual.
+            if remaining <= 0:
+                if self.verbose:
                     logger.warning(
-                        f"Process {pid} did not exit after {GRACE_PERIOD_SECONDS}s grace period. "
-                        f"Killing. => Gen. {job.generation}"
+                        f"Process {job.job_id.pid} exceeded timeout of {self.config.time} "
+                        f"(grace={grace}s). Killing. => Gen. {job.generation}"
                     )
                 job.job_id.kill()
                 return False
@@ -394,7 +396,7 @@ class JobScheduler:
                 )
                 # If all methods fail, assume process is dead
                 return False
-            
+
     def get_job_results(
         self, job_id: Union[str, ProcessWithLogging], results_dir: str
     ) -> Optional[Dict[str, Any]]:
