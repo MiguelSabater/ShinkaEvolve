@@ -2690,7 +2690,7 @@ class ShinkaEvolveRunner:
                     job_id=job_id,
                     exec_fname=exec_fname,
                     results_dir=results_dir,
-                    start_time=proposal_started_at,
+                    start_time=evaluation_started_at,
                     proposal_started_at=proposal_started_at,
                     evaluation_submitted_at=evaluation_submitted_at,
                     generation=generation,
